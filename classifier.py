@@ -7,7 +7,7 @@ import json
 import shutil
 import time 
 from glob import glob
-
+from random import shuffle
 
 from tensorflow.keras.mixed_precision import experimental as mixed_precision
 dtype = tf.float32
@@ -69,6 +69,30 @@ def write_im(ddata):
             new_path = os.path.expanduser(os.path.join(image_dir,'%s#$#%i#%s.png'%(str(label),int(1e5*np.random.uniform()),os.path.split(path)[1])))
             cv.imwrite(new_path,im)
 
+def resample_test(config):
+    # create new test set with equal number of class examples
+    all_test_files = glob(os.path.join(config['image_dir'],'test','*/*.png'))
+    shuffle(all_test_files)
+
+    test_counts = count_dataset(image_dir)['test']
+    min_key, min_count = -1, 1e8
+    for k, v in test_counts.items():
+        if v < min_count:
+            min_count = v 
+            min_key = k 
+    new_counts = {}
+    for k in test_counts.keys():
+        new_counts[k] = 0 
+
+    for f in all_test_files:
+        label, rest = f.split('#$#')
+        label = label.split('/')[-1]
+        if new_counts[label] < min_count:
+            new_counts[label] += 1 
+            new_path = os.path.join(config['image_dir'],'test_resampled',label,f.split('/')[-1])
+            if not os.path.isdir(os.path.split(new_path)[0]):
+                os.makedirs(os.path.split(new_path)[0])
+            shutil.copy(f, new_path)
     
 def create_dataset(image_dir, config, findings_labels, annotation_data):
     use_chexpert = 1 
@@ -197,19 +221,27 @@ def create_dataset(image_dir, config, findings_labels, annotation_data):
     for label_name, count in zip(findings_labels,counts):
         print(label_name,':',count)
 
+    ## resample test dataset
+    if 1:
+        resample_test(config)
+
 def count_dataset(image_dir):
-    files = glob(os.path.join(image_dir,'*.png'))
-    counts = {}
-    for f in files:
-        label, rest = f.split('#$#')
-        label = label.split('/')[-1]
-        if not label in counts:
-            counts[label]=0
-        else:
-            counts[label]+=1
-    print('[*] counts:')
-    for k, v in counts.items():
-        print(k,v)
+    c = {}
+    for mode in ['train','test']:
+        files = glob(os.path.join(image_dir,mode,'*/*.png'))
+        counts = {}
+        for f in files:
+            label, rest = f.split('#$#')
+            label = label.split('/')[-1]
+            if not label in counts:
+                counts[label]=0
+            else:
+                counts[label]+=1
+        print('[*] counts %s:' % mode)
+        for k, v in counts.items():
+            print(k,v)
+        c[mode] = counts
+    return c 
 
 def vis_gradcam(grad_model, im, label, classidx ):
     with tf.GradientTape() as tape:
@@ -236,7 +268,7 @@ def vis_gradcam(grad_model, im, label, classidx ):
     cam = tf.convert_to_tensor(cam)
     #cam = tf.nn.relu(cam)
     #rint('cam shape',cam.shape)
-    heatmap = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam))
+    heatmap = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam)+1e-8)
     heatmap = tf.transpose(heatmap,[2,1,0])
     heatmap = tf.image.resize(heatmap,im.shape[1:3])
     heatmap = tf.transpose(heatmap,[2,1,0])
@@ -254,8 +286,8 @@ def vis_gradcam(grad_model, im, label, classidx ):
     
     #guided_grad_cam = guided_grad_cam * (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam))
     #guided_grad_cam = (guided_grad_cam - tf.reduce_min(guided_grad_cam)) / (tf.reduce_max(guided_grad_cam) - tf.reduce_min(guided_grad_cam))
-    guided_grad_cam = guided_grad_cam * (cam - tf.reduce_min(cam,axis=[1,2],keepdims=True)) / (tf.reduce_max(cam,axis=[1,2],keepdims=True) - tf.reduce_min(cam,axis=[1,2],keepdims=True))
-    guided_grad_cam = (guided_grad_cam - tf.reduce_min(guided_grad_cam,axis=[1,2],keepdims=True)) / (tf.reduce_max(guided_grad_cam,axis=[1,2],keepdims=True) - tf.reduce_min(guided_grad_cam,axis=[1,2],keepdims=True))
+    guided_grad_cam = guided_grad_cam * (cam - tf.reduce_min(cam,axis=[1,2],keepdims=True)) / (tf.reduce_max(cam,axis=[1,2],keepdims=True) - tf.reduce_min(cam,axis=[1,2],keepdims=True)+1e-8)
+    guided_grad_cam = (guided_grad_cam - tf.reduce_min(guided_grad_cam,axis=[1,2],keepdims=True)) / (tf.reduce_max(guided_grad_cam,axis=[1,2],keepdims=True) - tf.reduce_min(guided_grad_cam,axis=[1,2],keepdims=True)+1e-8)
 
     guided_grad_cam = tf.expand_dims(guided_grad_cam,3)
     guided_grad_cam = tf.image.resize(guided_grad_cam,im.shape[1:3])
@@ -317,7 +349,7 @@ def load_datasetTFRECORD(config,mode = ["pad","crop"][0]):
     record_files = glob(os.path.join(config['image_dir'],'*.tfrecord'))
     dataset = tf.data.TFRecordDataset(filenames = record_files )
     dataset = dataset.batch(config['batch_size'])
-    dataset = dataset.shuffle(512)
+    dataset = dataset.shuffle(1024)
     nrepeat = 8 
     test_dataset = dataset.take(nrepeat*32 // config['batch_size']).repeat() 
     train_dataset = dataset.skip(nrepeat*32 // config['batch_size'])
@@ -330,6 +362,11 @@ def load_datasetPUREKERAS(config,mode = ["pad","crop"][0]):
     if 1:
         count_dataset(image_dir)
     
+    if 'resample_test' in config:
+        test_dir_id = "test_resampled"
+    else:
+        test_dir_id = "test"
+
     # https://www.tensorflow.org/api_docs/python/tf/keras/preprocessing/image/ImageDataGenerator
     train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
         rescale=1./255,
@@ -343,7 +380,7 @@ def load_datasetPUREKERAS(config,mode = ["pad","crop"][0]):
             target_size=(config['img_height'],config['img_width']),
             batch_size=config['batch_size'])
     validation_generator = test_datagen.flow_from_directory(
-            '%s/test' % image_dir,
+            '%s/%s' % (image_dir,test_dir_id),
             target_size=(config['img_height'],config['img_width']),
             batch_size=config['batch_size'])
     
@@ -434,52 +471,51 @@ METRICS = [
     tf.keras.metrics.Accuracy(name='accuracy')
 ]
 
+def downsample(filters,size = 3,strides=2, dilation_rate=(1, 1), apply_norm=True, dropout_rate = None, apply_lrelu = True, apply_softmax = False, initializer = 'he_normal'):
+    #initializer = ["he_normal","orthogonal", tf.random_normal_initializer(0., init_std)][0]
+
+    result = tf.keras.Sequential()
+    result.add(
+        tf.keras.layers.Conv2D(filters, size, strides=strides,
+                                    padding='same',
+                                    #kernel_constraint=wconst,
+                                    dilation_rate=dilation_rate,
+                                    kernel_regularizer=tf.keras.regularizers.l2(0.01),
+                                    activity_regularizer=tf.keras.regularizers.l2(0.01),
+                                    kernel_initializer=initializer))#,
+                                    #use_bias=False))  
+    if dropout_rate is not None and dropout_rate > 0.0:
+        result.add(tf.keras.layers.Dropout(dropout_rate))
+    if apply_norm:
+        result.add(tf.keras.layers.BatchNormalization())
+    if apply_lrelu:
+        result.add(tf.keras.layers.LeakyReLU())
+    if apply_softmax:
+        result.add(tf.keras.layers.Softmax())
+    return result
+
+def dense(filters,apply_norm=True, dropout_rate = None, apply_lrelu=True,apply_softmax=False,initializer = 'he_normal'):
+    
+    #initializer = ["he_normal","orthogonal", tf.random_normal_initializer(0., init_std)][0]
+
+    result = tf.keras.Sequential()
+    result.add(
+        tf.keras.layers.Dense(filters, 
+                                    #kernel_regularizer=tf.keras.regularizers.l2(0.01),
+                                    #activity_regularizer=tf.keras.regularizers.l2(0.01),
+                                    kernel_initializer=initializer))#,
+                                    #use_bias=False))  
+    if dropout_rate is not None and dropout_rate > 0.0:
+        result.add(tf.keras.layers.Dropout(dropout_rate))
+    if apply_norm:
+        result.add(tf.keras.layers.BatchNormalization())
+    if apply_lrelu:
+        result.add(tf.keras.layers.LeakyReLU())
+    if apply_softmax:
+        result.add(tf.keras.layers.Softmax())
+    return result
+
 def make_model(config, metrics = METRICS):
-    def downsample(filters,size = 3,strides=2, dilation_rate=(1, 1), apply_norm=True, dropout_rate = 0.2, apply_lrelu = True, apply_softmax = False):
-        initializer = 'he_normal'
-        #initializer = ["he_normal","orthogonal", tf.random_normal_initializer(0., init_std)][0]
-
-        result = tf.keras.Sequential()
-        result.add(
-            tf.keras.layers.Conv2D(filters, size, strides=strides,
-                                        padding='same',
-                                        #kernel_constraint=wconst,
-                                        dilation_rate=dilation_rate,
-                                        kernel_regularizer=tf.keras.regularizers.l2(0.01),
-                                        activity_regularizer=tf.keras.regularizers.l2(0.01),
-                                        kernel_initializer=initializer))#,
-                                        #use_bias=False))  
-        if dropout_rate is not None and dropout_rate > 0.0:
-            result.add(tf.keras.layers.Dropout(dropout_rate))
-        if apply_norm:
-            result.add(tf.keras.layers.BatchNormalization())
-        if apply_lrelu:
-            result.add(tf.keras.layers.LeakyReLU())
-        if apply_softmax:
-            result.add(tf.keras.layers.Softmax())
-        return result
-
-    def dense(filters,apply_norm=True, dropout_rate = None, apply_lrelu=True,apply_softmax=False):
-        initializer = 'he_normal'
-        #initializer = ["he_normal","orthogonal", tf.random_normal_initializer(0., init_std)][0]
-
-        result = tf.keras.Sequential()
-        result.add(
-            tf.keras.layers.Dense(filters, 
-                                        #kernel_regularizer=tf.keras.regularizers.l2(0.01),
-                                        #activity_regularizer=tf.keras.regularizers.l2(0.01),
-                                        kernel_initializer=initializer))#,
-                                        #use_bias=False))  
-        if dropout_rate is not None and dropout_rate > 0.0:
-            result.add(tf.keras.layers.Dropout(dropout_rate))
-        if apply_norm:
-            result.add(tf.keras.layers.BatchNormalization())
-        if apply_lrelu:
-            result.add(tf.keras.layers.LeakyReLU())
-        if apply_softmax:
-            result.add(tf.keras.layers.Softmax())
-        return result
-
     inp = tf.keras.layers.Input(shape=[config['img_height'],config['img_width'], 3], name='input_image')
 
     #inp = tf.keras.layers.Lambda(lambda x: tf.image.random_flip_left_right(x))(inp)
@@ -501,20 +537,23 @@ def make_model(config, metrics = METRICS):
         model = tf.keras.Model(inputs = inp,outputs = x, name = 'Classifier')
     else:
         x = inp
+        reg_l2 = 0.0#1
+        kernel_initializer=["he_normal","glorot_uniform"][1]
         cl = 0  
         layers = []
-        x = downsample(32,size=3)(x)
-        x = downsample(64,size=3)(x)
+        x = downsample(32,size=3,initializer = kernel_initializer)(x)
+        x = downsample(64,size=3,initializer = kernel_initializer)(x)
         while x.get_shape().as_list()[1] > 4:
             fs = min(512, 128 * 2**cl)
-            xx = tf.keras.layers.Conv2D(fs, 1, strides=1, padding='same')(x) 
+            xx = tf.keras.layers.Conv2D(fs, 1, strides=1, padding='same',kernel_regularizer=tf.keras.regularizers.l2(reg_l2),kernel_initializer=kernel_initializer)(x) 
 
             x = tf.keras.layers.BatchNormalization()(x)
             x = tf.keras.layers.ReLU()(x)
-            x = tf.keras.layers.Conv2D(fs, 3, strides=1, padding='same')(x)
+            x = tf.keras.layers.Conv2D(fs, 3, strides=1, padding='same',kernel_regularizer=tf.keras.regularizers.l2(reg_l2),kernel_initializer=kernel_initializer)(x)
+            x = tf.keras.layers.Dropout(0.3)(x)
             x = tf.keras.layers.BatchNormalization()(x)
             x = tf.keras.layers.ReLU()(x)
-            x = tf.keras.layers.Conv2D(fs, 3, strides=1, padding='same')(x)
+            x = tf.keras.layers.Conv2D(fs, 3, strides=1, padding='same',kernel_regularizer=tf.keras.regularizers.l2(reg_l2),kernel_initializer=kernel_initializer)(x)
             x = xx + x
             x = tf.keras.layers.MaxPool2D()(x)
             layers.append(x)
@@ -706,9 +745,9 @@ def train_classifier(config, image_dir):
                 #raw_img = example['image/encoded'].bytes_list.value[0]
                 #imo = tf.image.decode_png(raw_img)
                 #labelo = None
-                use_mixup = np.random.random() < 0.3 #0#step < 2500
+                use_mixup = np.random.random() < 0.5 #0#step < 2500
                 if use_mixup:
-                    for _ in range(3):
+                    for _ in range(1):
                         # mixup augmentation
                         _seed = 1337
                         mixup_r = tf.random.uniform([config['batch_size']],minval=0.0,maxval=0.2)
@@ -809,7 +848,105 @@ def train_classifier2(config, image_dir):
 
             step += 1 
 
+def get_header(w):
+    font = cv.FONT_HERSHEY_SIMPLEX
+    scale = 2.
+    color  = (230,230,230)
+    line_type = 2
+    h = int(w//3)
+    header = np.zeros((h,5*w,3)).astype(np.uint8)
+    cv.putText(header,"X-Ray Scan",(w//4,h//2),font, scale, color, line_type)
+    cv.putText(header,"Activation",(w+w//4,h//2),font, scale, color, line_type)
+    cv.putText(header,"Overlayed",(2*w+w//4,h//2),font, scale, color, line_type)
+    cv.putText(header,"Ground Truth",(3*w+w//4,h//2),font, scale, color, line_type)
+    cv.putText(header,"Predicted",(4*w+w//4,h//2),font, scale, color, line_type)
+    return header 
+
+def get_text_boxes(b, h, w, predicted, predicted_label, label_idx):
+    names = ['covid','pneumonia','no finding']
+    
+    font = cv.FONT_HERSHEY_SIMPLEX
+    scale = 1.5
+    color  = (230,230,230)
+    line_type = 2
+    v = np.zeros((h,2*w,3)).astype(np.uint8)
+    
+    text_gt = names[label_idx[b]]
+    text_pred = names[predicted_label[b]]
+    
+    textSize_gt = cv.getTextSize(text_gt, font, scale, line_type)[0]
+    textSize_pred = cv.getTextSize(text_pred, font, scale, line_type)[0]
+    # center the text
+    orig = ((w - textSize_gt[1])//2,
+              (h + textSize_gt[0])//2)
+    cv.putText( v, text_gt, orig, font, scale, color, line_type )
+
+    orig_pred = (w+(w - textSize_pred[1])//2,
+              (h + textSize_pred[0])//2)
+    cv.putText( v, text_pred, orig_pred, font, scale, color, line_type )
+
+    return v 
+
+def predict(config, model_file, image_file):
+    # python3.7 classifier.py --predict test --model ~/checkpoints/convid19/classification/2020-05-01_00-56-53/classifier.h5
+    model = tf.keras.models.load_model(model_file)
+    model.summary()
+    for i,layer in enumerate(model.layers):
+        print(i,layer.name)
+    LAYER_NAME = "re_lu_4"
+    grad_model = tf.keras.models.Model([model.inputs], [model.get_layer(LAYER_NAME).output, model.output])
+
+    if image_file == "test":
+        findings_labels, train_dataset, test_dataset = load_dataset(config)
+        c = 0
+        h,w = config['img_height'], config['img_width']
+        for (im, label) in test_dataset:
+            predicted = model(im,training=False).numpy()
+            print('predicted',predicted.shape)
+            predicted_label = np.argmax(predicted,axis=1)
+            print('predicted_label',predicted_label.shape)
+            #print(c,predicted_label)
+            vis_grad_covid = vis_gradcam(grad_model, im, predicted, 0).numpy()
+            vis_grad_pneumonia = vis_gradcam(grad_model, im, predicted, 1).numpy()
+            vis_grad_nofinding = vis_gradcam(grad_model, im, predicted, 2).numpy()
+            print('vis_grad_covid',vis_grad_covid.shape,vis_grad_covid.min(),vis_grad_covid.max())
+            
+            label_argmax = np.argmax(label,axis=1)
+            #for jv, vis in enumerate([vis_grad_covid,vis_grad_pneumonia,vis_grad_nofinding]):
+            mosaic = get_header(config['img_width'])
+            for b in range(predicted.shape[0]):
+                vis = vis_grad_covid
+                if predicted_label[b] == 1:
+                    vis = vis_grad_pneumonia
+                elif predicted_label[b] == 2:
+                    vis = vis_grad_nofinding
+                vis = np.uint8(255. * vis)
+                im = vis[b,:h,:,:]
+                heatmap = vis[b,h:2*h,:,:]
+                guided_grad_cam  = vis[b,2*h:3*h,:,:]
+                overlay = vis[b,3*h:4*h,:,:]
+
+                # draw 2 text boxes (ground truth, predicted)
+                text_boxes = get_text_boxes(b, config['img_height'], config['img_width'], predicted, predicted_label, label_argmax) 
+                
+                row = np.hstack((im,guided_grad_cam,overlay, text_boxes))
+                mosaic = np.vstack((mosaic, row))
+            # ['covid','pneumonia','no finding']
+            mosaic = cv.cvtColor(mosaic,cv.COLOR_BGR2RGB)
+            file_mosaic = '/tmp/%i.png' % (c)
+            cv.imwrite(file_mosaic, mosaic)
+            print('[*] wrote',file_mosaic)
+            c += 1 
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image_dir',default='~/data/convid/findings')
+    parser.add_argument('--predict',default = None)
+    parser.add_argument('--model', default=None, help = "model file.h5")
+    args = parser.parse_args()
+
+    image_dir = os.path.expanduser(args.image_dir)
     k=4
     config = {
         'num_classes': 3,
@@ -817,19 +954,26 @@ if __name__ == "__main__":
         "batch_size": 16,
         'epochs': 1000,
         "img_width": k*128,
-        "img_height": k*128           
+        "img_height": k*128,
+        'image_dir': image_dir
     }
+    
+    # predict
+    if args.predict is not None:
+        config['resample_test'] = True 
+        config['batch_size'] = 8
+        predict(config, args.model, args.predict)
+        
+    else:
+        # train 
+        # create dataset if not there
+        if not os.path.isdir(image_dir):
+            os.makedirs(image_dir)
+            for m in ['train','test']:
+                for l in [0,1,2]:
+                    os.makedirs(os.path.join(image_dir,m,str(l)))
 
-    image_dir = os.path.expanduser('~/data/convid/findings')
-    config['image_dir'] = image_dir
+            findings_labels, annotation_data = load_annotation_data(config)
+            create_dataset(image_dir, config, findings_labels, annotation_data)
 
-    if not os.path.isdir(image_dir):
-        os.makedirs(image_dir)
-        for m in ['train','test']:
-            for l in [0,1,2]:
-                os.makedirs(os.path.join(image_dir,m,str(l)))
-
-        findings_labels, annotation_data = load_annotation_data(config)
-        create_dataset(image_dir, config, findings_labels, annotation_data)
-
-    train_classifier(config, image_dir)
+        train_classifier(config, image_dir)
